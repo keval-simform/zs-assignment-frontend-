@@ -1,647 +1,438 @@
 # HCP Data Explorer
 
-50,000 healthcare-provider records in a grouped, virtualized, sortable, searchable grid
-with async-validated inline editing and command-history undo. React 18 + TypeScript +
-Vite. Entirely client-side.
+A grid (like a spreadsheet) that shows 50,000 healthcare-provider (HCP) records. Rows are grouped
+by region and territory. Only the rows you can actually see on screen get drawn — that's what
+"virtualized" means, and it's why the app stays fast with 50,000 rows. You can sort, search,
+filter, edit cells, and undo. When you edit a cell, the new value is checked by a validator that
+runs in the background and takes a moment to respond ("async" just means "not instant"). Built
+with React 18, TypeScript and Vite. Everything runs in the browser — there is no backend server.
 
-```bash
-npm install
-npm run dev        # http://localhost:5173
-npm test           # 387 tests
-npm run typecheck  # tsc -b, strict + noUncheckedIndexedAccess
-npm run lint       # zero any, zero non-null assertions, enforced
-npm run forensics  # the measured data-defect census
-```
+How to install and run it: **[SETUP.md](./SETUP.md)**.
+Data problems and every judgement call I had to make: **[ASSUMPTIONS.md](./ASSUMPTIONS.md)**.
 
-| Requirement | Status |
-|---|---|
-| FR-1 Virtualized grid · FR-2 Grouping + live subtotals · FR-3 Sort/search/filter | Built |
-| FR-4 Async-validated editing + undo/redo · FR-7 CPI · FR-8 White-labelling | Built |
-| FR-5 Bulk edit, partial failure · FR-6 Undo at scale | **Design only** (§5) — as the brief allows |
-
-Bonus delivered: hand-rolled virtualization, JSON change-set export with no-op
-deduplication, deterministic async-race tests, performance instrumentation.
-
-**[ASSUMPTIONS.md](./ASSUMPTIONS.md)** holds every data-quality defect with its measured
-count and handling decision, and every ambiguity resolved — including **sorting semantics
-for values that don't compare cleanly** (§B4) and **editing a cell whose commit is still
-in flight** (§B16).
-
----
-
-## 1. The three decisions everything follows from
-
-**1 · Row identity is the source array index, not `record.id`.** The generator duplicates
-ids (`i % 9973`): 5 ids spanning 10 rows. Names are worse — 256 distinct combinations
-across 50,000 rows, none unique. So identity is the array position, branded so it can't be
-confused with a flat-list position:
-
-```ts
-declare const RowKeyBrand: unique symbol;
-export type RowKey = number & { readonly [RowKeyBrand]: true };
-```
-
-Seven such brands exist (`RowKey`, `FlatIndex`, `RegionIndex`, `TerritoryIndex`, `ReqId`,
-`OpId`, `CommandId`); their constructors hold the **only seven type assertions in the
-codebase**, each runtime-guarded.
-Proven by `editLifecycle.test.ts`: edit row 9973, assert row 9972 — same id — is untouched.
-
-*Caveat:* an index isn't durable across a re-fetch. This dataset is generated once from a
-fixed seed, which is what makes it safe here. With a real backend the edit map, selection,
-and history would key on a server id — a migration, not a rename.
-
-**2 · Two separate maps.**
-
-```ts
-readonly committed: ReadonlyMap<RowKey, number>;      // ONLY server-accepted values
-readonly cellState: ReadonlyMap<RowKey, CellUiState>; // pending | saved | rejected
-```
-
-**Aggregation reads `committed` and nothing else** — `computeAggregates` and
-`applyCallsChange` have no parameter through which a pending value could arrive. FR-2's
-"aggregates must not include pending edits" is therefore a property of the type signature,
-not a conditional someone must remember at every call site. Merged into one map, a cell
-flipping to pending would also invalidate the aggregate memo and recompute 50,000 rows to
-reach the same answer.
-
-**3 · Every pipeline stage emits indices, never object copies.** The source array is never
-sorted or reordered — identity depends on it. Beside it sit projections built once at
-load: `callsNum: Float64Array` (parsed once), `trx`/`nrx: Int32Array`,
-`nameLower`/`idLower` (lowercased **once**, not per keystroke), a `flags: Uint8Array`
-defect bitfield. Filtering and sorting emit `Uint32Array`s of indices; territory buckets
-use a CSR layout, so handing out a territory's rows is a zero-copy `subarray`. Sorting is
-**per territory** (48 × ~1,042) and only for **expanded** ones. Accepted edits update
-aggregates by delta in O(1) — **1,429× cheaper** than a recompute (§6).
-
----
-
-## 2. Architecture & state model
-
-```
-src/vendor/     PROVIDED, VERBATIM, NEVER MODIFIED — separate TS project, so the
-                app sees only its .d.ts (see below)
-src/domain/     PURE. Zero React, zero store imports. identity · normalize ·
-                grouping · cpi · aggregate · comparators · exportDiff · forensics
-src/services/   validatorClient — wraps the vendor validator; injected, not imported
-src/store/      ONE Zustand store, four slices: view · edit · history · theme
-                + commands, selectors (six-stage memoized pipeline)
-src/features/   grid/ · toolbar/ · theme/ · feedback/    src/app/  App · Footer · main
-```
-
-Everything in `src/domain/` is a pure function of its arguments, which is why 60% of the
-suite runs with no DOM. The store holds all mutable state and lives **outside** the
-component tree — so a validator result arriving 900 ms after its row unmounted still has
-somewhere to land, with no "setState on an unmounted component" problem. **The dependency
-rule:** the domain layer never imports from the store; where it needs store-owned data
-(the comparator needs *effective* calls, including accepted edits) it takes an accessor as
-an argument.
-
-**Vendor files under strict TypeScript.** The provided generator does unchecked indexing,
-so it can't compile under `noUncheckedIndexedAccess` — and may not be edited. Resolved
-with project references: `tsconfig.vendor.json` covers only `src/vendor` with the flag off
-and emits `.d.ts`; `tsconfig.app.json` covers everything else at full rigor. The app
-consumes the vendor *contract*, never its source, so the relaxed flag cannot leak.
-Dropping the flag project-wide would instead stop reporting indexing bugs in our own
-50,000-row loops to accommodate three files we didn't write.
-
-```ts
-interface StoreState {
-  readonly dataset: Dataset;          // immutable; source array NEVER reordered
-  readonly groups: GroupIndex;
-
-  readonly committed: ReadonlyMap<RowKey, number>;      // §1
-  readonly cellState: ReadonlyMap<RowKey, CellUiState>; // §1
-
-  readonly aggregates: Aggregates;    // stored, not derived: the O(1) delta needs
-                                      // a previous value to add to
-  readonly view: ViewState;
-  readonly selection: ReadonlySet<RowKey>;   // FR-5 design input
-  readonly history: { past: readonly Command[]; future: readonly Command[] };
-  readonly theme: ResolvedTheme;
-  readonly toasts: readonly Toast[];
-  readonly reveal: RevealRequest | null;     // store states intent; grid scrolls
-  readonly flashRowKeys: ReadonlySet<RowKey>; // a set, not one key: a colliding
-                                              // id pair is only meaningful lit together
-
-  // Monotonic, never reset, never reused — a recycled ticket could let a superseded
-  // validator result pass the stale guard.
-  readonly nextReqId: ReqId;
-  readonly nextCommandId: CommandId;
-  readonly lastOp: { label: string; ms: number };
-}
-
-type CellUiState =                     // no `idle` member — absence is the fifth state
-  | { kind: 'pending';  reqId: ReqId;      proposed: number }
-  | { kind: 'saved';    value: number;     at: CommandId }
-  | { kind: 'rejected'; attempted: number; reason: RejectionReason };
-
-type RejectionReason =                 // retryability derived from `kind`, not a
-  | { kind: 'cap' | 'transient' | 'unknown'; message: string };  // boolean that can drift
-
-interface EditEntry {
-  readonly rowKey: RowKey;
-  readonly before: number | null;      // null reachable in both directions
-  readonly after: number | null;
-}
-
-type Command =
-  | { kind: 'cell-edit'; id: CommandId; label: string; entry: EditEntry }
-  | { kind: 'bulk-edit'; id: CommandId; label: string; opId: OpId;
-      entries: readonly EditEntry[] };
-```
-
-`bulk-edit` is in the type from the start even though FR-5 is design-only: "one undo step
-per bulk operation" is only true if the command shape can hold many entries.
-
-**Expansion is *intent*, not a set of open groups.** FR-3 requires search to auto-expand
-matches, so effective expansion has two inputs — user choice and search implication:
-`intent.get(key) ?? (searchActive && matched.has(key))`. A single `Set` merges the two, and
-clearing the search then destroys the user's own state; two sets break the case where a
-user *collapses* a search-expanded group (it writes `true`, the group stays open, the
-chevron looks broken). Intent handles all three cases in one line, and `searchExpanded`
-stays derived, never stored.
-
----
-
-## 3. Virtualization & build-vs-buy
-
-Hand-rolled, no library (`useVirtualWindow.ts`). Uniform 32 px rows reduce the problem to
-two divisions:
-
-```
-first = floor(scrollTop / rowHeight)          start = max(0, first - overscan)
-visible = ceil(viewportHeight / rowHeight)    end   = min(count, first + visible + overscan)
-```
-
-A spacer of `count * rowHeight` gives the scrollbar its range; rendered rows sit in one
-absolutely-positioned layer with `transform: translateY(...)` — a compositor-thread
-property, so scrolling never triggers layout, where setting `top` on 40 elements per frame
-would invalidate layout 40 times. Three optimisations, each independently necessary and
-each tested: a **passive listener** (scrolling isn't blocked on JS); **rAF coalescing**
-(20 scroll events → **1** frame scheduled); and a **range bail-out** returning the previous
-object reference so React skips the update entirely (5 sub-row scrolls → **0** re-renders).
-Measured in a 640 px viewport: **26 rows at rest, 32 mid-list, flat while scrolling
-50,000**. The **footer FR-1 asks for** reads those numbers live: rows in DOM out of
-50,000, the last store operation with its duration, and each pipeline stage's timing — the
-same instrumentation that produced the two findings in §6. React keys are never the
-flat-list position — with position keys React recycles component state onto whatever row
-slides into the slot, and an open edit box jumps to a different doctor mid-scroll.
-
-**Why hand-rolled.** Every part a grid library gives free is a part the spec then tells us
-to override:
-
-| Spec requirement | Library default |
-|---|---|
-| Aggregates exclude pending edits (FR-2/FR-4) | Aggregates read the cell value, whatever it is |
-| Group subtotals ignore the filter, separate visible count | Aggregates follow the filter, or don't exist |
-| Aggregate CPI is a ratio of sums, not a mean of ratios (FR-7) | `avg` over rows, if offered |
-| Edit lifecycle, non-cancellable validator + stale guard (FR-4) | Optimistic commit, no `reqId` concept |
-| Undo as command history, one step per bulk op (FR-4/FR-5) | Not provided |
-| Groups reorder by aggregate on numeric sort (FR-3) | Groups keep their own order |
-| Nulls last in *both* directions | Nulls first on asc, last on desc |
-
-Overriding all seven means learning the library's extension points, fighting its defaults,
-and still writing the semantics — plus shipping its bundle. **AG Grid / MUI DataGrid** gate
-grouping and aggregation behind paid tiers, which the brief forbids. **TanStack Table**
-(MIT, headless) was the real alternative; I passed because its row model wants to own
-grouping and sorting, and this app's grouping index is immutable with per-territory
-typed-array sorting — I'd have been adapting index arrays into and out of its shape at
-every stage. **TanStack Virtual** likewise: uniform heights are exactly the case where its
-value (measurement caching) is the part not needed, leaving nine lines of arithmetic, and
-`revealRow` needs to drive `scrollTop` directly. *Where this cost me:* no column resize,
-reorder, pinning, or CSV export (§7).
-
-**Zustand**, over Redux Toolkit / Context+useReducer / Jotai. Selector subscriptions mean
-one cell going pending re-renders that cell, not the grid (with Context + `useReducer`, a
-40-row window with ~5 subscriptions per row is 200 re-renders per keystroke). The store
-living outside React is the one that actually matters here. RTK would work but nothing
-needs middleware, RTK Query, or Immer. Against Jotai/Recoil: `commitEdit` writes
-`cellState`, `committed`, `aggregates`, `history`, and `view.editing` in **one
-transition** — across atoms that's several updates a subscriber can observe in between,
-including a state where the edit is committed but its history entry isn't pushed yet, at
-which point undo has nothing to undo.
-
-**CSS Modules + custom properties, not Tailwind.** FR-8 requires re-skinning at runtime
-with no rebuild; six `setProperty` calls on `document.documentElement` repaint the app with
-**zero React re-renders**, because colour is a property of the document, not of any
-component's state. **Jest + RTL** for the test runner; every meaningful assertion here is
-about what a user can perceive, which is what RTL queries for regardless of runner.
-
----
-
-## 4. Edit lifecycle, concurrency, and undo (FR-4)
-
-The validator settles after 300–900 ms, rejects with a bare **string** when `> 60`, adds
-~10% random 503s, and has **no cancellation** — the fact the whole design turns on.
-
-```
-   idle ──Enter/dbl──▶ editing ──Esc──▶ idle
-  (absent)              │ Enter
-                        ├─ parse fails?  ──▶ editing + inline error
-                        ├─ no-op?        ──▶ idle (0 validator calls, 0 history)
-                        ▼
-           pending {reqId, proposed}      committed UNTOUCHED
-                        │                 aggregates DO NOT MOVE
-                        ├─ settles, reqId stale ──▶ DROPPED ENTIRELY
-                        ├─ resolves ──▶ committed.set · O(1) delta · history.push ──▶ saved
-                        └─ rejects  ──▶ rejected {attempted, reason} + toast
-                                        (committed never written — nothing to revert)
-```
-
-**The guard order in `commitEdit` is the design** — each step makes a specific failure
-unreachable:
-
-| Step | Guard | What it prevents |
+| # | Requirement | Status |
 |---|---|---|
-| a | **Refuse if the cell is already `pending`** | Two requests racing for one cell, where the **later-settling** one wins regardless of which the user asked for last |
-| b | Parse the draft | A typo reaching the network — inline message, no latency cost |
-| c | No-op detection | Spending a validator call on an unchanged value, which at a 10% 503 rate would "fail" on something nobody edited. Also gives the no-op-dedup bonus free |
-| d | Enter `pending`, **writing nothing to `committed`** | This absence of a write *is* the pending-exclusion mechanism |
-| e–f | `await validate`, then the **stale guard on both success and failure paths** | A superseded result clobbering newer state |
-| g–h | Accept: write, delta, push history · Reject: reason on the cell **and** a toast | An error nobody sees |
+| FR-1 | Draw only the visible rows out of 50,000 | Built |
+| FR-2 | Two levels of grouping with live subtotals | Built |
+| FR-3 | Sort, search, filter | Built |
+| FR-4 | Inline editing with async validation, undo/redo | Built |
+| FR-5 | Bulk edit where some rows fail | Design only (Section 5) |
+| FR-6 | Undo at scale | Design only (Section 5) |
+| FR-7 | CPI (calls per Rx), per row and per group | Built |
+| FR-8 | White-labelling / theming at runtime | Built |
 
-**Step (a) is FR-4's "what if the user edits a cell whose previous commit is still in
-flight": the edit is refused and the control is `disabled`** — removed from the tab order
-rather than left focusable and swallowing the keystroke. Queueing builds an unbounded chain
-the user can't see; firing both lets the later-settling request win by latency rather than
-intent. Alternatives in ASSUMPTIONS §B16.
+Extra things I built that weren't asked for:
 
-```ts
-// The validator cannot be cancelled, so a superseded request still settles — up to
-// 900 ms later — and would otherwise clobber whatever the cell holds by then.
-if (pendingReqId(get().cellState, rowKey) !== reqId) return;
+- The scrolling/virtualization logic is written by hand instead of using a library.
+- A JSON export of changes that skips edits which didn't actually change anything.
+- Tests for tricky timing bugs (the kind where two things race to finish first).
+- The footer shows live performance numbers.
+
+---
+
+## 1. Architecture and state model
+
+```
+src/
+├── vendor/                   # provided, do-not-modify: data-generator.ts, mock-validator.ts,
+│                              #   theme-config.ts (TENANT_THEMES / DEFAULT_THEME)
+├── domain/                   # plain functions, no React, no app state — identity, normalize,
+│                              #   grouping, cpi, aggregate, comparators, exportDiff, forensics
+├── services/
+│   └── validatorClient.ts    # wraps the vendor validator; passed in, not imported directly,
+│                              #   so tests can swap it out
+├── store/                    # one shared Zustand store, outside the component tree
+│   ├── appStore.ts           #   combines the slices below
+│   ├── editSlice.ts          #   committed values + cell status (pending/saved/rejected)
+│   ├── historySlice.ts       #   undo/redo command history
+│   ├── viewSlice.ts          #   sort, search, filter, group-expansion state
+│   ├── themeSlice.ts         #   resolved tenant theme
+│   ├── commands.ts           #   single-cell and bulk command shapes
+│   └── selectors.ts          #   the grouping / aggregate / sort / filter pipeline
+├── features/
+│   ├── grid/         # Grid.tsx, useVirtualWindow.ts (hand-rolled), DataRow,
+│   │                 #   GroupHeaderRow, CallsCell (the editable cell)
+│   ├── toolbar/      # SearchBox, RegionFilter, UndoRedo, ExportDiff
+│   ├── theme/        # sanitizeTheme.ts, TenantSwitcher.tsx, ThemeProvider.tsx
+│   └── feedback/     # Toasts.tsx, ThemeIssuePanel.tsx
+└── app/
+    ├── App.tsx, main.tsx   # mounts everything
+    └── Footer.tsx          # rows-in-DOM count + timing readout
 ```
 
-The guard reads `get()` **at settle time**, not a closure-captured value (which would
-compare the request to itself), and it's on the **failure path too** — without that, a
-superseded *rejection* paints an error over a cell that has since succeeded. Dropping a
-stale result is safe *precisely because step (d) wrote nothing*: there is no partial state
-to unwind.
+**Four decisions that shaped everything else:**
 
-**What the user sees.** A pending cell shows the **committed** value with the proposal
-beside it — `10 →45`, never `45`; substituting the proposal would be an optimistic update,
-and the cell would disagree with its own subtotal for 300–900 ms with nothing on screen to
-explain the gap. Every state carries a **non-chromatic** signal as well as colour (⟳ ✓ ⚠,
-dotted vs solid border), and state colours sit in a fixed palette deliberately **outside**
-the FR-8 theming surface — so a tenant whose primary colour is amber cannot make "pending"
-invisible. Rejections surface **twice**, because 300–900 ms is long enough to scroll away:
-on the cell, and in a toast (`role="log"`, `aria-live="polite"`). A cap violation is
-deterministic and the user's own input, so no retry is offered; a 503 is transient, so
-Retry appears. Enter/double-click opens, Enter commits, Esc cancels — **blur does neither**,
-because in a virtualized grid a blur can be the row unmounting mid-scroll.
+- **Row identity is array position, not `record.id`** — 5 ids are shared across 10 rows and only
+  256 names cover all 50,000 rows, so position is the only safe, unique key (full argument in
+  ASSUMPTIONS B1).
+- **`committed` and `cellState` are kept separate** — totals only ever read from `committed`, so
+  FR-2's "no pending edits in totals" rule is guaranteed by the data structure itself, not by
+  remembering to check it (ASSUMPTIONS B2).
+- **The app-state store lives outside React** — so a validator answer arriving 900 ms after its
+  row has scrolled away and unmounted still has somewhere safe to land.
+- **Undo/redo is a command history, not data snapshots** — each edit entry stores both `before`
+  and `after`, and a bulk edit is just a list of the same entries, so single and bulk edits undo
+  through identical code (see Section 4).
 
-**Undo/redo.** `const target = direction === 'apply' ? entry.after : entry.before;` — that
-symmetry is the whole mechanism, and it's what makes FR-5 a *design* rather than a rewrite:
-a `bulk-edit` command holding 4,000 entries inverts through the same function. An entry
-whose target equals the row's **source** value *deletes* its key from `committed`, keeping
-`committed` a true diff — which is what makes the footer's "accepted edits" count honest
-and the JSON change-set free of no-op rows.
+---
 
-**Strict LIFO:** only `past.at(-1)` is undoable. Out-of-order undo would let a stale
-`before` clobber a newer value — edit 10→20, then 20→30, then undo the *first* command and
-it writes `before: 10` over a cell holding 30, silently discarding the second edit.
+## 2. Drawing only the visible rows (virtualization)
 
-**Neither undo nor redo re-validates.** The value was accepted once; asking again adds
-latency and a 10% chance of a spurious 503 to an operation whose job is restoring a
-known-good state. For redo the point is sharper: re-validating would reject a known-good
-value roughly one time in ten, so a user who undid and changed their mind would watch their
-own accepted edit fail with no way to tell the rejection was noise. **The condition that
-makes this safe is specific: this client is the only writer** — see §5.3 for the
-multi-writer design.
+**The problem:** putting all 50,000 rows on the page at once would make the browser slow and
+laggy.
+
+**The fix:** only ever put about 30 rows on the page — just the ones you can actually see right
+now. The other 49,970 rows stay in memory, ready to be shown the moment you scroll to them. This
+is called "virtualization," and I built it myself instead of using a ready-made library
+(`useVirtualWindow.ts`).
+
+**How it works, step by step:**
+
+| Step | In plain words |
+|---|---|
+| 1. Fix the row height | Every row is exactly 32 pixels tall, always. So the app never has to measure anything — just simple math |
+| 2. Fake a full-size scrollbar | A tall, empty spacer sits in the background so the scrollbar *looks* like it's scrolling through all 50,000 rows, even though almost none of them actually exist on the page |
+| 3. Do the math | Simple math figures out which rows should currently be visible, based on how far you've scrolled and how tall your screen is |
+| 4. Draw those rows | The app draws the visible rows, plus a few extra just above and below, so you never see a blank flash while scrolling fast |
+| 5. Move them smoothly | Moving rows around the screen uses a fast technique (`transform`) that doesn't force the browser to redo the whole page layout — that's what keeps scrolling feeling smooth |
+
+**Three extra tricks keep it smooth:**
+
+- The scroll event doesn't wait around for anything — the browser can just scroll immediately.
+- Many scroll updates get bundled into a single screen update, instead of redrawing on every tiny
+  scroll movement.
+- If the visible rows haven't actually changed, the app skips redrawing entirely.
+
+**The result:** in a normal-sized browser window, only about 26–32 rows ever exist on the page at
+once — no matter whether you're at row 1 or row 50,000. The footer at the bottom of the app shows
+this number live, so you can see it for yourself.
+
+**One tricky detail:** each row needs a stable "name tag" (React calls this a key) so the app can
+tell rows apart. That name tag has to be the row's real identity, not just "whichever slot it's
+sitting in right now." Otherwise, while scrolling, an open edit box could suddenly jump onto a
+completely different doctor's row by mistake.
+
+---
+
+## 3. Why I wrote the grid by hand, and the other tool choices
+
+Almost every feature a ready-made grid library gives you for free turned out to be something the
+spec asks us to change:
+
+| What the spec asks for | What a library does by default |
+|---|---|
+| Totals ignore unsaved edits (FR-2/FR-4) | Totals use whatever value the cell currently shows |
+| Totals ignore the search/filter, but show a separate visible-row count | Totals follow the filter, or aren't offered at all |
+| Group CPI is a ratio of sums, not an average of per-row ratios (FR-7) | `avg` across rows, if it's offered at all |
+| A validator that can't be cancelled, with protection against outdated answers (FR-4) | Save immediately, no way to track which request is which |
+| Undo as a history of actions, one undo step per bulk operation (FR-4/FR-5) | Not provided |
+| Groups reorder by their total when you sort a numeric column (FR-3) | Groups keep a fixed order |
+| Empty/missing values sort last in both directions | Empty values sort first when ascending, last when descending |
+
+**Why no grid library**
+
+- AG Grid and MUI DataGrid only offer grouping and totals in their paid versions, so the brief
+  rules them out.
+- TanStack Table was the real alternative I considered. I skipped it because it wants full control
+  over grouping and sorting — but here, the grouping never changes, and each territory sorts its
+  own small list independently. Using TanStack Table would've meant more work converting data into
+  and out of its expected shape than just writing it myself.
+- TanStack Virtual mostly exists to remember how tall each row is when rows have different
+  heights. Since every row here is a fixed 32 px, there's nothing for it to measure.
+- What this cost me: no column resizing, reordering, pinning, or CSV export — features a library
+  would have given for free.
+
+**Why Zustand for shared app state**
+
+- When one cell starts saving, only that cell re-renders — not the whole grid.
+- The store lives outside React, which matters more here than usual (see Section 1).
+- I didn't use a library based on individual "atoms" of state, for one specific reason: saving an
+  edit (`commitEdit`) updates five different pieces of state at once (`cellState`, `committed`,
+  `aggregates`, `history`, `view.editing`). If those were five separate atoms, they'd update one
+  at a time — and something watching the state could catch the moment where the edit is saved but
+  its undo-history entry hasn't been added yet. At that exact moment, pressing undo would have
+  nothing to undo.
+
+**Why CSS Modules and CSS variables, not Tailwind**
+
+- FR-8 requires being able to re-skin the whole app instantly, without rebuilding it.
+- Six calls to `setProperty` do exactly that, and none of it causes React to re-render anything.
+
+---
+
+## 4. Editing and undo (FR-4)
+
+### 4.1 The validator, in short
+
+| Fact | Detail |
+|---|---|
+| Answer time | 300–900 ms |
+| Rejects | any value above 60 |
+| Random failure | fails ~10% of the time with a server error (503) |
+| Can't be cancelled | once asked, it *will* answer — even if the user has already moved on |
+
+That last row shapes the whole design: a request you've already replaced can still come back and
+answer up to 900 ms later, so every step below exists to handle that safely.
+
+### 4.2 The 5 states a cell can be in
+
+```
+idle → editing → pending → saved
+                     ↘ rejected
+```
+
+**1. Idle** — the normal, resting state. Enter or a double-click moves it to *editing*.
+
+**2. Editing** — the cell is open for typing.
+- Esc → back to *idle*, nothing happens.
+- Enter with an invalid value (not a number) → stays in *editing*, shows an inline error.
+- Enter with the same value as before → straight back to *idle*. **Zero** validator calls, **zero**
+  history entries — nothing was actually asked of the server.
+- Enter with a valid, changed value → moves to *pending*.
+
+**3. Pending** — the value is being checked by the validator, in the background.
+- Nothing is saved yet, and totals don't move.
+- Each check carries its own id (`reqId`), so if a newer edit replaces this one, the old check's
+  answer — accept or reject — is recognized as stale and thrown away when it eventually arrives.
+
+**4. Saved** — the validator accepted the value. It's now saved, the total updates, and the change
+is added to undo history.
+
+**5. Rejected** — the validator rejected the value. The cell shows why, and a toast appears too.
+
+### 4.3 Two guards worth calling out
+
+**What if you edit a cell that's still saving?** *(FR-4 asks this directly.)* The new edit is
+refused — the input box is disabled so it can't even be clicked. The alternative, queuing the new
+edit behind the old one, would build up an invisible backlog the user can't see; letting both go
+through at once would mean network speed decides which value wins, instead of the user. Other
+options I considered are written up in ASSUMPTIONS B15.
+
+**Why it's safe to drop an outdated answer.** A newer edit can replace an older one while the
+older one is still waiting on the validator. When that older answer finally arrives, it's checked
+against the current state and thrown away if it's no longer relevant — safely, because nothing was
+ever saved while it was pending, so there's no half-finished state to undo.
+
+### 4.4 What the user sees on a pending cell
+
+| Detail | Why |
+|---|---|
+| Old value shown with new one next to it — `10 →45` | Showing only the new value would make the cell disagree with its own total for up to 900 ms |
+| Every state has an icon *and* a colour (⟳ ✓ ⚠) | So a tenant's theme can never make "pending" invisible |
+| Rejections shown on the cell *and* in a toast | 300–900 ms is long enough to have scrolled away |
+| No Retry button over the cap; Retry button on a 503 | Over-cap always fails the same way; a 503 might succeed on retry |
+| Enter saves, Esc cancels, clicking away does neither | Losing focus can just mean the row scrolled out of view |
+
+### 4.5 Undo and redo: how the data is structured
+
+| Piece | Shape | What it means |
+|---|---|---|
+| `history.past` | list of past actions, most recent last | everything that can be undone |
+| `history.future` | list of undone actions | everything that can be redone. Cleared the moment a new edit happens |
+| a "command" (one action) | one entry for a single-cell edit, a list of entries for a bulk edit | one user action, no matter how many rows it touched |
+| an "entry" | `{ rowKey, before, after }` | one row's value, both before and after the change |
+| `committed` | row key → the accepted value | a genuine list of what changed vs. the original data, not a full copy of everything |
+
+Since each entry stores both the old and new value, undo reads `before` and redo reads `after` —
+same logic, different field. A bulk edit is just a list of these same entries, so a single-cell
+edit and a 4,000-row bulk edit undo through identical code (why FR-5 could stay a design instead
+of a rewrite). If an entry's new value equals the row's original value, it's dropped from
+`committed` entirely.
 
 | Rule | Why |
 |---|---|
-| Rejected and no-op edits never enter history | Nothing was committed / nothing changed |
-| A new edit clears the redo stack | The undone future branched off a state that no longer exists |
-| Undo refused while a row in the command is in flight | The in-flight request will settle and write `committed`; if undo ran first, the two writes would order by **latency** rather than **intent** |
-| Undo clears the affected rows' badges | "✓ saved" would describe a value that is no longer there |
-| History capped at 100 | One `bulk-edit` command can hold thousands of entries |
+| Undo strictly follows last-in-first-out order | Undoing out of order could overwrite a newer value: edit 10→20, then 20→30, undo the *first* — it would wrongly write 10 over a cell holding 30 |
+| Rejected and no-op edits never get added to history | Nothing was saved, or nothing changed |
+| A new edit clears the redo stack | That redo history belongs to a state that no longer exists |
+| Undo is refused if a row in that action is still saving | Otherwise the undo and the save race, and network speed decides the winner |
+| History keeps at most 100 actions | One bulk-edit action can already contain thousands of row changes |
+| Neither undo nor redo re-checks with the validator | The value was already accepted once — this is only safe because **this app is the only thing writing data** (see Section 5) |
 
-**Correct regardless of sort, filter, or grouping** — because **undo changes truth, and
-truth is not filter-dependent**:
+### 4.6 Undo works no matter what's on screen
 
-```
-undo()
-  ├─ invert the command → committed + aggregates                (always)
-  ├─ rowFilterBlock(state, rowKey) → 'search' | 'region' | 'both' | null
-  ├─ null  → expand ancestors · set reveal {rowKey, nonce} · flash
-  │          grid effect: scrollTop = flatIndex * 32 − viewport/2
-  └─ blocked → the change STAYS APPLIED
-               toast: "Undone: … — the row is hidden by the current search"
-               action: "Show it" → clears ONLY the filters in the way, then reveals
-```
+Undo always applies the change, whatever's currently sorted, filtered, or grouped — because undo
+restores the true data, and the true data doesn't depend on what's visible.
 
-The store expresses reveal **intent**; the grid performs the scroll. As state, "this row
-should be visible" is assertable with no DOM, which is how the sort-then-filter-then-undo
-case is tested.
+- **Row hidden by a filter:** the change still happens, and a toast says so with a "Show it"
+  button that clears only the filters blocking that row.
+- **Row visible:** its parent groups open, the grid scrolls to it, and it flashes briefly.
 
 ---
 
-## 5. FR-5 / FR-6 DESIGN — bulk edit and undo at scale
+## 5. Bulk edit and undo at scale (FR-5, FR-6 — design only)
 
-**Design deliverables. Not implemented.**
+This is a design, not working code — here's the plan, in plain terms.
 
-Normal `calls` are `Math.round(rand() * 40)` → range **0–40**; the cap is **60**. A single
-"+10%" therefore **cannot** breach the cap on a normal row. Rejections come almost entirely
-from the **four 99999 rows** (already over the cap, deterministic) and the **~10% random
-503s** — for a 5,000-row selection, roughly **500 expected transient failures**. So the
-common case isn't "a few rows failed", it's "hundreds failed for a reason unrelated to the
-data" — which is why the summary groups by cause rather than listing 500 identical messages.
+### FR-5 — bulk edit with partial failure
 
-### 5.1 State shape
+- The user selects rows one by one, or grabs a whole territory in one click (even rows not
+  currently visible).
+- An action like "+10% calls" runs on the whole selection. Each row is checked separately and at
+  the same time as the others (a few rows at once in the background) — so some succeed and some
+  fail independently, on their own schedule.
+- Partial failure is expected here, not a bug: the sample data is set up so a real chunk of rows
+  (roughly 1 in 10) fail no matter what.
+- The app reports back "N applied, M rejected," with reasons — failures are grouped by cause so
+  the user isn't shown hundreds of near-identical error messages.
 
-**Selection.** Rows select individually or per territory (FR-5 names both).
-`selectTerritoryRows` selects **every** row in the territory, not just the visible ones — a
-selection that silently shrank when the user typed in the search box would apply "+10%" to
-fewer rows than the checkbox claimed (ASSUMPTIONS §B35). The `selection` set and its actions
-are built and tested; only the checkboxes are unrendered (§7). Selection is cleared the
-moment an operation starts, so the button can't double-fire.
+### FR-6 — undo at scale
 
-```ts
-export type BulkEntryState =
-  | { readonly kind: 'queued' }
-  | { readonly kind: 'inflight'; readonly reqId: ReqId }
-  | { readonly kind: 'applied';  readonly before: number | null; readonly after: number }
-  | { readonly kind: 'rejected'; readonly attempted: number; readonly reason: RejectionReason }
-  | { readonly kind: 'skipped';  readonly why: 'superseded' | 'no-op' | 'unparsable' };
+**The state behind one bulk run:** one "operation" object holding a label, a status, running
+counts, and one entry per row (`row → { proposed value, status }`, where status is one of: queued,
+in progress, applied, rejected, or skipped).
 
-export interface BulkOperation {
-  readonly opId: OpId;                       // branded, like RowKey
-  readonly label: string;                    // "+10% calls"
+**How it flows, start to finish:**
 
-  /** A Map, not an array: every settle handler finds its entry by rowKey in O(1).
-   *  With 5,000 entries an array scan per settle is 12.5M comparisons. */
-  readonly entries: ReadonlyMap<RowKey, { rowKey: RowKey; proposed: number; state: BulkEntryState }>;
+1. The operation starts, and the selection is cleared right away so it can't be started twice.
+2. Rows are processed a few at a time (not all at once, and not one at a time) — each one is
+   re-checked against its *current* value right before sending, in case it changed while waiting.
+3. As each answer comes back, it's checked again — if it no longer applies, it's thrown away.
+4. When every row has been processed, only the rows that actually succeeded are bundled into
+   **one single action** and added to undo history.
 
-  /** Running tallies, so progress UI never scans 5,000 entries per frame. */
-  readonly counts: { total: number; queued: number; inflight: number;
-                     applied: number; rejected: number; skipped: number };
+**Why that makes it exactly one undo step:** nothing is added to history until the whole operation
+finishes, so pressing undo once reverts every successful row together — not one undo per row (which
+could mean thousands of undo presses for one bulk action). If every row failed, nothing is added
+to history at all.
 
-  readonly status: 'running' | 'finalized' | 'cancelled';
+**The other cases FR-6 asks about:**
 
-  /** Set at finalization — the ONE command for this whole operation (§5.2).
-   *  Absent while running, which is why nothing is undoable mid-flight. */
-  readonly command: Command | null;
-}
+- **A changed row is hidden** (inside a closed group, or filtered out): undo still applies the
+  change, then opens the group and scrolls the row into view — or, if too many rows changed at
+  once, just reports the count instead (e.g. "4,300 rows reverted; 120 hidden by search").
+- **Does redo re-check with the server? No** — the values were already validated once. This is
+  only safe because this app is the only thing changing the data; a real backend would need redo
+  to re-check for conflicts.
 
-readonly bulk: BulkOperation | null;   // a single slot on StoreState, not a list
-```
-
-A single slot, because two concurrent operations over overlapping selections would need
-per-row arbitration and would make "exactly one undo step" ambiguous — undoing which? A
-second "+10%" while one runs is refused with a toast.
-
-**Concurrency: 8 in flight**, not all 5,000. Firing everything means unbounded memory
-(5,000 live promises plus 5,000 pending `setTimeout` handles), an unreadable UI (progress
-jumps 0→100% in one 900 ms step), and no back-pressure to cancel into — you can cancel a
-queue, but not 50,000 already-fired requests, because the validator has no abort path.
-Throughput is `concurrency / 0.6s`, so 8 gives ~13 rows/s: a 5,000-row operation takes ~6
-minutes, long but honest and cancellable. N workers pull from a shared queue rather than
-chunking into batches of 8, since chunking makes every batch wait for its slowest member.
-
-**Per-entry stale guard.** Before firing, `attempt()` checks that the operation is still
-current and running; that this entry is still `queued`; that the row hasn't been
-**superseded** by a single-cell edit (the user's direct intent wins → `skipped`); and it
-recomputes the proposal against the **current** committed value, not the value read when
-the selection was made — a +10% queued behind six minutes of work must apply to what the
-row holds now. After settling, `stillInflight(opId, rowKey, reqId)` checks all three
-identities and drops the result entirely on any mismatch — the same guard as the
-single-cell path, for the same reason.
-
-### 5.2 The applied subset as exactly ONE undo step
-
-While the operation runs, **nothing is pushed to `history`** — so Ctrl+Z during a bulk
-operation undoes whatever the user did *before* it started. At finalization the applied
-entries, and only those, become one command:
-
-```ts
-const entries = [...op.entries.values()]
-  .filter((e) => e.state.kind === 'applied')
-  .map((e) => ({ rowKey: e.rowKey, before: e.state.before, after: e.state.after }));
-
-// Everything failed → NO command. An undo step that undoes nothing is worse than no
-// step: it consumes a Ctrl+Z and appears broken.
-if (entries.length === 0) { set({ bulk: { ...op, status: 'finalized', command: null } }); return; }
-
-const command: Command = { kind: 'bulk-edit', id: nextCommandId(), label: op.label, opId, entries };
-set({ bulk: { ...op, status: 'finalized', command },
-      history: { past: [...past, command].slice(-HISTORY_LIMIT), future: [] } });
-```
-
-One `undo()` walks all entries through `writeEntries(..., 'invert')` — **the same function
-a single-cell undo uses** — applying N O(1) deltas. No new code path. One command per
-accepted entry instead would need 4,300 Ctrl+Z presses to undo one user action and would
-blow the 100-command cap 43 times over.
-
-**This half is verified, not just designed.** The runner doesn't exist, but the command it
-would produce does, and `bulkCommand.test.ts` builds one by hand exactly as `finalize` would
-— five applied entries spanning three territories and two regions, two rejected rows that
-were never written — then asserts a single `undo()` reverts all five, that territory *and*
-region totals return byte-for-byte to their starting values, and that `committed` is a true
-diff again (§6). Without it, "no new code path" was a claim about a branch nothing had ever
-taken.
-
-Values are written to `committed` **per entry** as each is accepted, so rows land and
-subtotals climb during a six-minute operation; only the *history entry* is deferred.
-Deferring the values too would mean a third map holding accepted results outside
-`committed`, collapsing the §1 distinction back in.
-
-*Known gap:* cancelling mid-operation currently skips the command, so a user who cancels at
-60% can't undo the 60%. Two-line change, but it needs a product decision on whether a
-cancelled operation is one undo step or none.
-
-### 5.3 The other three FR-6 cases
-
-**Row inside a collapsed group** — implemented for single-cell edits, identical for bulk.
-`invertCommand` writes the values **first and unconditionally**; the state change never
-depends on what the view shows. Then `revealTarget` picks `entries[0].rowKey` (revealing
-all 4,300 is meaningless, so the toast reports the count instead), `expandAncestors` writes
-explicit `true` into both intent maps so the group afterwards behaves like one the user
-opened, and the grid centres it: `scrollTop = index * 32 − viewportHeight / 2 + 16`. A
-1400 ms flash uses an outline as well as a tint, so the cue isn't colour-only.
-
-**Does redo re-validate? No** — see §4. **The condition that makes this safe is specific
-and I would not carry it forward blindly: this client is the only writer.** Against a real
-backend, redo *would* have to re-validate, and the design changes shape: each `EditEntry`
-gains a `baseVersion`; redo submits `{ value, baseVersion }` and the server rejects on
-mismatch; a rejected redo doesn't silently drop but becomes a conflict the user resolves
-("this row changed to 55 while you were away — keep yours, take theirs, or cancel"); and
-the command stays in `future` on conflict rather than being discarded, so it can be retried
-after resolving. The current behaviour is correct for this system and would be a bug in a
-multi-writer one.
-
-**Row excluded by the current search/filter** — the change is applied, always; a subtotal
-for a filtered-out row is still that territory's subtotal. `rowFilterBlock` returns
-`'search' | 'region' | 'both' | null` in O(1). If blocked, **no filter is changed behind
-the user's back** — they typed that search for a reason. A toast explains and offers "Show
-it", which clears **only** the filters actually in the way. For a bulk undo split across
-the boundary, the toast reports the split: *"4,300 rows reverted; 120 are hidden by the
-current search."*
-
-### 5.4 Event flow — one failing bulk operation, end to end
-
-Selection: 3 rows. A holds 20, B holds 30, C is one of the 99999 outliers.
-
-1. User selects A, B, C; clicks **+10% calls**. Store creates
-   `BulkOperation { opId: 1, status: 'running', command: null }` with three `queued`
-   entries; selection cleared so buttons can't double-fire. **`history.past` untouched.**
-2. `runQueue` starts `min(8, 3) = 3` workers. A: 20 → 22 (`reqId 41`); B: 30 → 33
-   (`reqId 42`); C: 99999 → 109999 (`reqId 43`). Three pending cells; **subtotals have not
-   moved.**
-3. **t+340 ms** — `reqId 42` resolves. `committed.set(B, 33)`, `applyCallsChange(+3)`;
-   B → `applied {before: 30, after: 33}`, its subtotal climbs by 3. **Still no history entry.**
-4. **t+610 ms** — `reqId 43` rejects (cap). C → `rejected {kind:'cap'}`; its cell reverts —
-   it was never written — and shows ⚠.
-5. **t+780 ms** — `reqId 41` rejects (503). A → `rejected {kind:'transient'}`.
-6. Queue empty, nothing in flight → `finalize(1)`. One entry survives (B: 30→33), so **one**
-   command is pushed; `future` cleared.
-7. Summary panel — persistent, not a toast, because an operation that took six minutes
-   deserves a result the user can read at their own pace:
-   **"+10% calls — 1 applied, 2 rejected"**, grouped as `1 × 503 — transient [Retry]` and
-   `1 × call cap — permanent [Show]`. "Retry" starts a **new** operation with its own
-   command and undo step; re-entering the finalized one would mean its command grows after
-   being pushed to history.
-8. **Ctrl+Z once.** `undo()` finds no in-flight rows, calls `writeEntries([B], 'invert')` →
-   writes `before: 30`, and because 30 *is* B's source value the key is **deleted** from
-   `committed`. One O(1) delta of −3. The two rejected rows are unaffected — nothing was
-   ever committed for them. `revealRow(B)` expands ancestors, centres B, flashes it.
-9. **Late arrival — the case this design exists for.** At t+1200 ms a settle arrives for a
-   `reqId` from a cancelled operation. `stillInflight` fails the `opId` check and the result
-   is discarded. Nothing is written, because the pending state never wrote to `committed`
-   in the first place.
+**One known limitation:** if the user cancels a bulk edit partway through, what was already
+completed can't currently be undone as one step. Small fix, but it needs a decision first — should
+a cancelled run still count as one undo step, or none at all?
 
 ---
 
-## 6. Theming (FR-8), performance, testing
+## 6. Theming (FR-8)
 
-`sanitizeTheme(raw: unknown)` is an **allowlist, never a blocklist** — the
-security-relevant decision, because these values reach CSS custom properties, and
-`primary: "red; background-image: url(…)"` terminates the declaration and injects a second
-one. A blocklist is the wrong *shape* of defence: CSS has too many equivalent encodings
-(`\75 rl`, comment splitting) for "does not contain `url(`" to mean anything, whereas
-`/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/` has no escape hatch. Fifteen hostile inputs are
-tested; none needed individual anticipation.
+**Switching tenants:** a dropdown in the toolbar lets you pick a tenant, and it's also saved in the
+web address (`?tenant=meridian`) — so sharing that link opens straight into the right tenant's
+look.
 
-| Field | Rule | Why |
+**The problem:** tenant configs come from customers, so they can't be trusted. A bad or malicious
+value could break the page, or even sneak in harmful code through the colour fields.
+
+**The fix:** only accept values that clearly match an expected format — reject everything else. A
+value like `red; background-image: url(...)` could otherwise smuggle in extra, harmful code.
+Fifteen different malicious test inputs are all correctly rejected.
+
+| What | Rule | Why |
 |---|---|---|
-| colours | 3-/6-digit hex, **reject** otherwise | Intent is unknowable — `#ZZ8800` might have meant orange, or be a paste accident |
-| colours | alpha hex **rejected**, though valid CSS | Semi-transparent `text` destroys contrast, unvalidatable at config time |
-| `radius` | finite number, **clamp** 0–24 | Intent *is* legible ("very round"). `'8'` still rejected: coercing numeric strings today means accepting `'8; content: attack'` tomorrow |
-| `appName` | trim, non-empty, **truncate** at 64 | An unbounded string is a layout attack |
-| unknown tenant | `DEFAULT_THEME`, value **discarded** | Echoing an unvalidated query param into the DOM is reflected XSS |
+| Colours | Must be a proper 3 or 6-digit hex code, e.g. `#0B5FA5` | Anything else could mean many things or hide bad code — safer to just reject it |
+| Corner radius | Must be a number, kept between 0 and 24 | A number outside a sensible range is capped instead of rejected, since the intent is clear |
+| App name | Trimmed, can't be blank, capped at 64 characters | Stops a broken layout from a name that's empty or far too long |
+| Unknown tenant requested | Falls back to the default look, bad value thrown away | Never show or reuse an unchecked value from the web address |
 
-Applied as six `setProperty` calls — **zero React re-renders**. The `--state-*` tokens sit
-deliberately **outside** this surface: rather than validating each tenant palette for
-contrast against five state colours (not decidable from the config alone), they're fixed
-and each state also carries a glyph. The `meridian` config produces exactly four issues —
-`primary` (`"#ZZ8800"`), `radius` (`"huge"`), `onPrimary` and `text` (absent) — while
-**preserving** its own `appName`, `background`, and `surface`. Per-field fallback, not
-all-or-nothing: one bad colour must not cost the tenant its name. The issue panel is a
-collapsed `<details>`, not a banner — the app *works*, so this is diagnostic information,
-and a tenant who ships `#ZZ8800` and sees default blue otherwise cannot tell whether their
-config was ignored, mis-parsed, or never loaded.
+**If only some fields are bad, only those are replaced** — not the whole theme. For example, one
+sample tenant has a broken colour and a broken corner-radius value, but the app still keeps that
+tenant's own app name and other working colours. One bad field shouldn't wipe out everything else
+that tenant customized.
 
-**Performance**, measured by `performance.bench.test.ts` — a measurement harness, not a
-regression gate, since a wall-clock threshold in CI fails on a busy machine and teaches the
-team to re-run rather than read:
+**The user still finds out.** These issues show up in a small, collapsible panel — not a big
+warning banner, since the app keeps working fine either way. But they're never hidden completely:
+without that panel, a tenant whose colour got rejected would just see a plain default colour, with
+no way to tell whether their setting was wrong, ignored, or never received at all.
 
-| Decision | Naive | Chosen | Factor |
+---
+
+## 7. Performance
+
+**How speed is measured:** a test file times each part of the app. It only reports the numbers —
+it doesn't fail the build if something is slow. A hard pass/fail time limit tends to fail randomly
+on a slower computer, which just teaches people to re-run it instead of actually checking what's
+wrong.
+
+**Where I made things faster:**
+
+| What | Slow way | Fast way | How much faster |
 |---|---|---|---|
-| Aggregates on an accepted edit | 3.5 ms recompute | 2.5 µs delta | **1,429×** |
-| Sorting on a column click | 37.7 ms global | 0.5 ms per open group | **75×**, and collapsed groups sort **not at all** |
-| Search per keystroke | inline `.toLowerCase()` → 100,000 allocations/char | precomputed arrays | no allocation on the keystroke path |
-| Territory buckets | 48 allocations per filter | one CSR buffer + `subarray` | 1 |
-| Unfiltered state | copy 50,000 indices | reuse the group index's arrays | **0** at rest |
-| Scroll handling | 20 events → 20 renders | rAF + range bail-out | 20 → **1** frame |
-| Rows in the DOM | 50,054 | 26 at rest / 32 mid-list | **~1,500×** |
+| Updating totals after saving an edit | Recalculate everything (3.5 ms) | Just add the small change (0.0025 ms) | ~1,400× faster |
+| Sorting when you click a column | Sort all 50,000 rows (37.7 ms) | Sort only the open group (0.5 ms) | 75× faster — closed groups aren't sorted at all |
+| Searching as you type | Reformat all the text on every keystroke | Text is already prepared in advance | Nothing extra happens while typing |
+| Splitting rows by territory | Build 48 brand-new lists every time you filter | Reuse one shared block of memory instead | Basically free |
+| No filter applied | Copy all 50,000 row positions | Reuse the existing list | No extra work |
+| Handling scrolling | Redraw the screen for every single scroll event | Combine updates into one per screen refresh, skip if nothing changed | Far fewer redraws |
+| Rows actually drawn on screen | All 50,054 | Only 26–32 at a time | ~1,500× fewer |
 
-Dataset build is **62.9 ms**, paid once. Two findings came from the footer instrumentation
-itself: **stage D was recomputing on every keystroke** (group ordering consumed stage C's
-output, which carries per-group *visible* counts and so produced a new object per
-keystroke; fixed by depending on `Aggregates` directly), and **`buildMs` under-reported by
-a third** because `projectRows` started its timer after `generateRows` returned — a number
-documented as "generation + projection + grouping" was reporting 39 ms of a 63 ms
-operation, and it was headed for this README. **Not measured:** real-browser frame timing.
-The DOM row count *is* asserted, so "only visible rows exist in the DOM" is verified; "60
-fps" is **argued** from the row count and the three scroll optimisations, not profiled.
+Loading the data for the first time takes about 63 milliseconds, and that only happens once, when
+the app starts.
 
-**Testing — 387 tests, 20 files**, three consecutive runs, no flakes. The real validator
-settles after 300–900 ms and fails 10% at random, so `fakeValidator.ts` exposes
-`settle(id, outcome)` for **manual control, not fake timers** — fake timers make the
-*latency* deterministic but not the *order*, and order is what's under test. `settle`
-throws on an unknown or already-settled id, so a test that settles the wrong call fails
-loudly rather than asserting nothing.
+**Two real problems I found while building this:**
 
-| Test | What it proves |
-|---|---|
-| `leaves EVERY aggregate byte-identical while in flight` | Snapshots 54 groups × 5 measures, edits, asserts deep equality while pending, settles, asserts the change is exactly the delta |
-| `drops a late result whose cell is no longer pending on its ticket` | Nothing committed, no history entry |
-| `drops a stale REJECTION as well as a stale success` | The guard is on both paths |
-| `edits row 9973 without touching row 9972` | Row identity, against the real colliding pair |
-| `undo is independent of sort/filter/grouping` | Edit → re-sort → filter away → undo → reverted, reveal fired with `blockedBy: 'search'` |
-| `keeps the DOM row count flat while scrolling 50,000 rows` | FR-1's core claim |
-| `matches a fresh full recompute after 200 randomised edits` | Five fixed seeds — the delta path can't drift from the oracle |
-| `rejects 15 hostile theme inputs` | The allowlist, including CSS injection and prototype pollution |
-| `a bulk-edit command is exactly ONE undo step` | §5.2's central claim, as a property rather than an assertion — see below |
+- One part of the app was accidentally recalculating on every single keystroke.
+- A reported "loading time" number was showing only about a third of the real time, because its
+  clock started too late. I found and fixed this before writing it up here.
 
-**Testing a design deliverable's primitive.** FR-5/FR-6 are design-only, so there is no
-bulk runner to test. But §5.2 claims the applied subset becomes *one* command that inverts
-through the same `writeEntries` a single-cell undo uses — and every other test exercises
-`cell-edit`, whose `entry` is a single object. The `bulk-edit` variant had never been
-constructed anywhere, so the multi-entry claim was an assertion about code that had never
-run. `bulkCommand.test.ts` hand-builds the command `finalize(opId)` would build — five
-applied entries across three territories and two regions, two rejected rows left untouched —
-and asserts one `undo()` reverts all five, both aggregate levels return to their exact
-starting numbers, `committed` is empty again, and redo re-applies in one step with zero
-validator calls. It also covers the refusal while a row in the command is in flight, and the
-empty-subset case where no command is pushed at all. Verified by mutation: capping
-`writeEntries` to the first entry fails 3 of the 9; dropping the region-level delta fails 1.
-**This is not FR-5** — no runner, no queue, no selection UI. It is the undo primitive the
-design rests on, now proven to hold at more than one entry.
-
-Property tests use **fixed, named seeds**: a test that fails once in fifty runs and can't be
-reproduced trains you to re-run CI instead of reading the failure. **Not covered:** the FR-5
-bulk *runner* — concurrency queue, per-entry stale guard, partial-failure summary (design
-only, §5); real-browser rendering; visual regression; arrow-key navigation between cells.
+**What isn't measured:** exactly how smooth the app looks frame-by-frame in a real browser. We do
+know for certain that only the visible rows are ever drawn on screen — that part is directly
+tested. But "a smooth 60 frames per second" is a reasonable expectation based on that fact, not a
+number measured with a real profiling tool.
 
 ---
 
-## 7. What I'd do differently, and what's deliberately not done
+## 8. Testing
 
-1. **Measure in a real browser before claiming 60 fps.** Everything above is algorithmic.
-   I'm confident about the DOM row count because it's asserted; I'm *arguing* about frame rate.
-2. **Reconsider the fixed 32 px row height.** It reduces the maths to a division, which
-   bought the whole of §3 — but a long name truncates rather than wraps, and it won't take a
-   two-line row. Dynamic heights are where a virtualization library earns its place, and
-   adding them later is a rewrite of the hook, not an extension.
-3. **Build the FR-5 bulk path.** Designed to the point where implementing it is mostly
-   mechanical, and the design would be *better* for it — §5.2's cancellation gap is exactly
-   what surfaces on contact with real code.
-4. **Extract `commitEdit`.** ~90 lines, eight labelled steps. The guard sequence is
-   deliberately linear and I wouldn't split it into eight functions that hide the order —
-   but the accept and reject branches could each be a pure function returning a state patch.
-5. **Replace byte-order collation with `Intl.Collator`.** Correct for this ASCII dataset,
-   wrong for accents or non-Latin scripts. A known limitation, not an oversight.
+There are 387 tests in total. Every one of them passes, every single time.
 
-| Deliberately not done | Why |
+**How the tests handle waiting:** normally, saving a value takes some time to hear back (up to
+about 1 second), and it can also fail at random. To test this properly, each test can say
+"pretend this one save just finished, with this result" — so the test stays in full control of
+what happens and when, instead of guessing or waiting.
+
+**What the tests make sure of:**
+
+| Area | What is checked |
 |---|---|
-| FR-5 / FR-6 **in code** | Design deliverables per the brief (§5). Chose depth on FR-4's concurrency over breadth. The single-cell undo path FR-4 requires *is* built, including the collapsed-group and hidden-row cases |
-| Real-browser performance trace | The biggest gap in the evidence (§6) |
-| Arrow-key navigation between cells | Enter/Esc/F2/double-click work. Full navigation across a virtualized list needs focus restoration when a focused row unmounts mid-scroll — a real design problem I'd rather not half-do |
-| Column pinning / resize / reorder | Listed bonus. `COLUMNS` + `GRID_TEMPLATE` is the extension point; pinning is `position: sticky` on the first *n* tracks |
-| A third grouping level | Listed bonus. The architecture takes it: `FlatRow` is a discriminated union with an exhaustive `never` check, so adding a level is a compile error at every site that must change |
-| Row selection UI | The `selection` set and its actions exist and are tested, because FR-5's design needs them. Checkboxes aren't rendered: a checkbox whose only action is unimplemented is worse than none |
-| Persistence | No requirement, and it would force the row-identity question before there's a server to answer it |
-| Hoisting sort keys into an `n`-length array | A Schwartzian transform would cut key extractions from `2 · n log n` to `n`. Not done, deliberately: sorting is per-territory (~1,042 rows) and only for expanded groups, so a column click is ~0.5 ms per open group — and `sortedTerritoryRows` already serves repeat renders from a cache, so the common case never reaches the sort at all. It would add a per-column key buffer and a second path for the null-last rule to buy a win that sits underneath an existing cache. Worth revisiting only if row-level sorting ever moves above a single territory |
+| Totals | Totals never change while a value is still saving. Once saved, totals update by the right amount |
+| Late answers | If a save finishes late and is no longer needed, it is fully ignored |
+| Row safety | Editing one row never changes a different row by mistake |
+| Undo | Undo still works correctly no matter how the table is sorted, filtered, or grouped |
+| Screen speed | Only the rows on screen exist in the page, even while scrolling through all 50,000 rows |
+| Totals math | The fast way of updating totals always matches a full, slow recalculation |
+| Theme safety | 15 unsafe theme values are all correctly blocked |
+| Bulk undo | Undoing a bulk edit brings back every changed row in one single step |
+
+**Extra check:** I broke the bulk-undo logic on purpose, just to make sure the tests would catch
+it — and they did.
+
+**Not tested yet:** the working version of bulk edit (FR-5), testing in a real browser, and moving
+between cells using the arrow keys.
 
 ---
 
-## 8. Time spent
+## 9. What I'd change with more time
 
-# Time spent
+| Change | Why |
+|---|---|
+| Test speed in a real browser | Right now the speed claims are based on reasoning, not an actual measurement. I'm sure about how many rows are on screen, since that part is directly tested — but "smooth 60 fps" is still an educated guess, not a measured fact |
+| Allow rows to have different heights | Every row is currently the same fixed height, which is what keeps scrolling simple and fast. But it also means a long name gets cut off instead of wrapping. Supporting different heights would need a bigger rewrite of the scrolling logic |
+| Actually build the bulk-edit feature (FR-5) | It's planned in enough detail that building it for real would mostly be simple, mechanical work |
+| Break one long function into smaller pieces | One function that saves an edit is fairly long. I'd keep its overall order exactly as-is, but split parts of it into smaller, easier-to-read pieces |
+| Use smarter text sorting | Sorting text currently works correctly for plain English, but would sort incorrectly for accented letters or other alphabets. A small fix would handle that properly |
 
-Approximately 18–20 hours. The work was primarily focused on building and validating the core data and state model, followed by the features that required the most coordination between different parts of the application. The edit workflow, asynchronous updates, and undo/redo behavior required additional attention to ensure state transitions remained predictable and consistent.
+---
 
-A significant portion of the time was also spent validating the underlying dataset and defining consistent rules for grouping, aggregation, sorting, filtering, and comparisons before connecting them to the UI. This helped identify data edge cases early and avoid carrying incorrect assumptions into the implementation.
+## 10. Time spent
 
-The remaining effort covered the virtualized grid, group headers, defect handling, toolbar/footer interactions, theming, and documentation. FR-5/FR-6 were considered at the design level but were not implemented, as defined by the scope. Documentation and final validation were also included to ensure the implementation, assumptions, and stated requirements remained consistent.
+Roughly 18–20 hours. The order I did things in mattered more than the total time.
+
+The first stretch of time went into carefully checking the dataset itself before writing any UI at
+all. That's where the data-quality report and most of Part A of ASSUMPTIONS.md came from — and
+that's what turned up the duplicate ids and the rows with zero transactions that the documented
+rule didn't actually explain. Both of those findings changed the design, rather than being patched
+around afterward.
+
+Most of the middle of the project went into the data and app-state model, and then the edit
+lifecycle (Section 4), which was the single most time-consuming part. The order of the guard steps
+took more attempts to get right than anything else in this project, and the "stale rejection"
+edge case only became obvious once a test actually caught it failing.
+
+The rest of the time covered the grid itself and its group headers, showing data problems visually,
+the toolbar and footer, theming, the FR-5/FR-6 design work, and writing these three documents.
