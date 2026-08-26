@@ -1,0 +1,39 @@
+.footer {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border-strong);
+  background: var(--tenant-surface);
+  /* Readable at presentation zoom: 13px (not 11-12, which most browsers'
+     page-zoom rendering blurs first) with tabular figures so digits do not jitter
+     as they change during a scroll, and a floor via clamp() so a narrow shared
+     screen never shrinks it further. */
+  font: clamp(13px, 1.1vw, 15px) / 1.5 var(--font-ui);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.label {
+  color: var(--muted);
+}
+
+.value {
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+.pending {
+  color: var(--state-pending);
+}
+
+.spacer {
+  flex: 1;
+}

@@ -1,0 +1,86 @@
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  background: var(--tenant-surface);
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-right: 4px;
+}
+
+.appName {
+  font-size: 15px;
+  font-weight: 700;
+  margin: 0;
+}
+
+.rowCount {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.input,
+.select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: calc(var(--tenant-radius) / 2);
+  background: var(--tenant-background);
+  color: var(--tenant-text);
+  font: inherit;
+}
+
+.input {
+  width: 220px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.button {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: calc(var(--tenant-radius) / 2);
+  background: var(--tenant-primary);
+  color: var(--tenant-on-primary);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.ghost {
+  background: transparent;
+  border-color: var(--border-strong);
+  color: var(--tenant-text);
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}

@@ -1,0 +1,233 @@
+.shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+/* The single scroll container. Column headers are sticky inside it, so vertical
+   scrolling pins them and horizontal scrolling carries them with the content —
+   which a separate header element outside the container could not do without
+   mirroring scrollLeft by hand. */
+.viewport {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--tenant-background);
+  border-top: 1px solid var(--border);
+  contain: strict;
+}
+
+.headerRow {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: var(--grid-template);
+  align-items: stretch;
+  height: var(--row-height);
+  background: var(--tenant-surface);
+  border-bottom: 1px solid var(--border-strong);
+  min-width: fit-content;
+}
+
+.headerCell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border: 0;
+  background: none;
+  color: var(--tenant-text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.headerCell:hover {
+  background: color-mix(in srgb, var(--tenant-primary) 10%, transparent);
+}
+
+.headerCellNumeric {
+  justify-content: flex-end;
+}
+
+.sortIndicator {
+  color: var(--tenant-primary);
+  font-size: 10px;
+  min-width: 8px;
+}
+
+.sortIndicatorInactive {
+  color: transparent;
+}
+
+.headerCell:hover .sortIndicatorInactive {
+  color: var(--muted);
+}
+
+/* Gives the scrollbar its full range without any of those rows existing. */
+.spacer {
+  position: relative;
+  min-width: fit-content;
+}
+
+.window {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: var(--grid-template);
+  align-items: center;
+  height: var(--row-height);
+  border-bottom: 1px solid var(--border);
+  min-width: fit-content;
+}
+
+.dataRow:hover {
+  background: color-mix(in srgb, var(--tenant-primary) 6%, transparent);
+}
+
+.cell {
+  padding: 0 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cellNumeric {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.idCell {
+  font-family: var(--font-mono);
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Group rows -------------------------------------------------------------- */
+
+.groupRow {
+  background: var(--tenant-surface);
+  font-weight: 600;
+}
+
+.regionRow {
+  background: color-mix(in srgb, var(--tenant-primary) 12%, var(--tenant-surface));
+}
+
+.groupLabel {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.territoryIndent {
+  padding-left: 28px;
+}
+
+.chevron {
+  display: inline-block;
+  width: 12px;
+  flex: 0 0 12px;
+  color: var(--muted);
+  transition: transform 120ms ease;
+}
+
+.chevronOpen {
+  transform: rotate(90deg);
+}
+
+.groupName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.groupCount {
+  color: var(--muted);
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.groupMatching {
+  color: var(--tenant-primary);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* Defect markers ---------------------------------------------------------- */
+
+.missing {
+  color: var(--muted);
+}
+
+.badge {
+  font-size: 10px;
+  line-height: 1;
+  cursor: help;
+}
+
+.badgeDuplicate {
+  color: var(--state-warning);
+}
+
+.badgeOutlier {
+  color: var(--state-outlier);
+  font-weight: 700;
+}
+
+.empty {
+  padding: 2rem;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* The editable Calls column supplies its own padding and focus ring. */
+.cellEditable {
+  padding: 0;
+  overflow: visible;
+}
+
+/* A revealed row is highlighted with an outline as well as a tint, so the cue is
+   not colour-only. */
+.flash {
+  outline: 2px solid var(--tenant-primary);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--tenant-primary) 16%, transparent);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .flash {
+    animation: flashFade 1400ms ease-out;
+  }
+}
+
+@keyframes flashFade {
+  from {
+    background: color-mix(in srgb, var(--tenant-primary) 34%, transparent);
+  }
+}

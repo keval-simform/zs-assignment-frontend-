@@ -1,0 +1,28 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "types": ["vite/client"],
+    "useDefineForClassFields": true,
+
+    /* Rigor. CLAUDE.md constraint 4 ("zero any, zero !, zero unchecked casts") is
+       enforced by these flags plus the ESLint rules in eslint.config.js. */
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "allowUnreachableCode": false,
+
+    // INVARIANT: forces imports of src/vendor/* to resolve to the vendor project's
+    // emitted declarations rather than its source. Without this, tsc would happily
+    // read the .ts files back in and re-report their errors under our strict flags.
+    "disableSourceOfProjectReferenceRedirect": true
+  },
+  "include": ["src", "vite.config.ts", "jest.config.ts"],
+  "exclude": ["src/vendor"],
+  "references": [{ "path": "./tsconfig.vendor.json" }]
+}

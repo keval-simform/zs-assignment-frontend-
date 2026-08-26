@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "./.tsbuild/vendor",
+    "rootDir": "./src/vendor",
+    "tsBuildInfoFile": "./.tsbuild/vendor.tsbuildinfo",
+
+    // DECISION: this flag is relaxed for exactly three files we are forbidden to
+    // edit (HARD CONSTRAINT 1). The generator indexes SPECIALTIES/REGIONS/FIRST/LAST
+    // and rows[i-1] without bounds checks, which cannot compile under the app's
+    // settings. Isolating it in its own project means the app consumes only the
+    // emitted .d.ts, so the relaxation is physically unable to leak into our code.
+    // Alternative rejected: dropping noUncheckedIndexedAccess project-wide.
+    "noUncheckedIndexedAccess": false
+  },
+  "include": ["src/vendor"]
+}

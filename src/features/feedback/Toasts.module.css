@@ -1,0 +1,92 @@
+.region {
+  position: fixed;
+  right: 14px;
+  bottom: 44px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(380px, calc(100vw - 28px));
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 4px 8px;
+  padding: 8px 10px;
+  border-radius: var(--tenant-radius);
+  border-left: 4px solid var(--state-rejected);
+  background: var(--tenant-background);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 18%);
+  font: 12px/1.45 var(--font-ui);
+}
+
+.info {
+  border-left-color: var(--tenant-primary);
+}
+
+.marker {
+  grid-row: span 2;
+  align-self: start;
+  color: var(--state-rejected);
+  font-size: 13px;
+  line-height: 1.3;
+}
+
+.infoMarker {
+  color: var(--tenant-primary);
+}
+
+.title {
+  font-weight: 600;
+}
+
+.detail {
+  grid-column: 2;
+  color: var(--muted);
+}
+
+.actions {
+  grid-column: 2;
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.action {
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--tenant-text);
+  font: inherit;
+  font-weight: 600;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.dismiss {
+  grid-row: span 2;
+  align-self: start;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.notRetryable {
+  grid-column: 2;
+  margin-top: 4px;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.clearAll {
+  align-self: flex-end;
+  pointer-events: auto;
+}

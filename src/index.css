@@ -1,0 +1,62 @@
+/*
+ * Base tokens.
+ *
+ * The `--tenant-*` variables are the FR-8 surface: Phase 7 rewrites them on
+ * `document.documentElement` at runtime and nothing else changes. Their values here
+ * mirror the vendor DEFAULT_THEME so the app renders correctly before any tenant
+ * is resolved, and so a tenant that supplies nothing still looks finished.
+ *
+ * The `--state-*` variables are deliberately NOT tenant-derived. See CallsCell.
+ */
+:root {
+  --tenant-primary: #0b5fa5;
+  --tenant-on-primary: #ffffff;
+  --tenant-background: #ffffff;
+  --tenant-surface: #f2f5f8;
+  --tenant-text: #16202e;
+  --tenant-radius: 8px;
+
+  /* Fixed semantic palette for edit-cell states. Never overridden by a tenant, so
+     a pending or rejected cell stays legible under every provided theme. */
+  --state-pending: #8a5a00;
+  --state-pending-bg: #fff6e0;
+  --state-saved: #10633c;
+  --state-saved-bg: #e6f5ec;
+  --state-rejected: #a3141b;
+  --state-rejected-bg: #fdeaea;
+  --state-outlier: #7a3d00;
+  --state-warning: #8a5a00;
+
+  --border: color-mix(in srgb, var(--tenant-text) 14%, transparent);
+  --border-strong: color-mix(in srgb, var(--tenant-text) 26%, transparent);
+  --muted: color-mix(in srgb, var(--tenant-text) 58%, transparent);
+
+  --row-height: 32px;
+  --font-ui: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--tenant-background);
+  color: var(--tenant-text);
+  font: 13px/1.4 var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Visible focus everywhere. Removing it would fail WCAG 2.4.7 and make the
+   keyboard navigation in FR-4 unusable. */
+:focus-visible {
+  outline: 2px solid var(--tenant-primary);
+  outline-offset: -2px;
+}

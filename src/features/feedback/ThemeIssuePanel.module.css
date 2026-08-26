@@ -1,0 +1,68 @@
+.panel {
+  border-top: 1px solid var(--border-strong);
+  background: var(--tenant-surface);
+  font: 12px/1.5 var(--font-ui);
+}
+
+.summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-weight: 600;
+  list-style: none;
+}
+
+.summary::-webkit-details-marker {
+  display: none;
+}
+
+.chevron {
+  color: var(--muted);
+  transition: transform 120ms ease;
+}
+
+.panel[open] .chevron {
+  transform: rotate(90deg);
+}
+
+.count {
+  color: var(--state-warning);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 8px;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 4px 12px;
+  border-top: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.table th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.field {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.received {
+  font-family: var(--font-mono);
+  color: var(--state-rejected);
+  word-break: break-all;
+}
+
+.note {
+  padding: 4px 12px 8px;
+  color: var(--muted);
+}

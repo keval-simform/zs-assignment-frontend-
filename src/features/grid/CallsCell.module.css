@@ -1,0 +1,128 @@
+/*
+ * Edit-state styling.
+ *
+ * INVARIANT: every state carries a NON-CHROMATIC signal as well as a colour — a
+ * spinner glyph, a check, a warning glyph, a dotted vs solid border. WCAG 1.4.1
+ * requires that colour is never the only carrier of information, and FR-8 requires
+ * these states to stay distinguishable under every tenant theme. One mechanism
+ * satisfies both: the glyphs and border styles survive any palette, so a tenant
+ * cannot make a pending cell indistinguishable from a saved one no matter what hex
+ * values it supplies.
+ *
+ * The colours themselves come from the FIXED `--state-*` tokens in index.css, never
+ * from `--tenant-*`. A tenant whose primary colour happened to be amber must not be
+ * able to make "pending" invisible.
+ */
+.cell {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  height: 100%;
+  padding: 0 8px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  cursor: text;
+  width: 100%;
+  text-align: right;
+}
+
+.cell:hover:not(.pending) {
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+.marker {
+  font-size: 10px;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+
+/* pending --------------------------------------------------------------- */
+.pending {
+  color: var(--state-pending);
+  background: var(--state-pending-bg);
+  /* Dotted border is the non-chromatic half of the signal. */
+  box-shadow: inset 0 0 0 1px var(--state-pending);
+  border-style: dotted;
+  cursor: progress;
+}
+
+.proposed {
+  opacity: 0.72;
+  font-style: italic;
+}
+
+.spinner {
+  display: inline-block;
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Respect a user's reduced-motion preference: the glyph still marks the state. */
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
+}
+
+/* saved ----------------------------------------------------------------- */
+.saved {
+  color: var(--state-saved);
+  background: var(--state-saved-bg);
+}
+
+/* rejected -------------------------------------------------------------- */
+.rejected {
+  color: var(--state-rejected);
+  background: var(--state-rejected-bg);
+  box-shadow: inset 0 0 0 1px var(--state-rejected);
+  border-style: dotted;
+}
+
+/* editing --------------------------------------------------------------- */
+.input {
+  width: 100%;
+  height: calc(var(--row-height) - 6px);
+  padding: 0 6px;
+  border: 2px solid var(--tenant-primary);
+  border-radius: 3px;
+  background: var(--tenant-background);
+  color: var(--tenant-text);
+  font: inherit;
+  font-family: var(--font-mono);
+  text-align: right;
+}
+
+.inputInvalid {
+  border-color: var(--state-rejected);
+}
+
+.inputError {
+  position: absolute;
+  z-index: 3;
+  margin-top: 2px;
+  padding: 3px 6px;
+  border-radius: 3px;
+  background: var(--state-rejected);
+  color: #fff;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.editing {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding: 0 4px;
+}

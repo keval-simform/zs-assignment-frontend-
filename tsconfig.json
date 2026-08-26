@@ -1,0 +1,6 @@
+{
+  // Solution root. No files of its own — `tsc -b` walks the references in order.
+  // See CLAUDE.md § TYPECHECK TOPOLOGY for why vendor is a separate project.
+  "files": [],
+  "references": [{ "path": "./tsconfig.vendor.json" }, { "path": "./tsconfig.app.json" }]
+}
